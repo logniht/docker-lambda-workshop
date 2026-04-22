@@ -197,6 +197,8 @@ Two flags worth calling out:
 - **`scanOnPush=true`** — ECR runs its own vulnerability scan every time you push. Defence in depth alongside Scout.
 - **`IMMUTABLE` tags** — prevents overwriting an existing tag. A deployed tag cannot silently change under you.
 
+> **Immutable tags and `:latest` don't mix.** With `IMMUTABLE`, pushing any tag that already exists — including `:latest` — fails with `tag immutable`. This is the feature working, not a bug. Use unique tags per build (commit SHA or semver) and skip `:latest` entirely. For a human-friendly pointer that moves over time, use a **Lambda alias** pointing at a published version, not a mutable image tag. Aliases move; the image stays put.
+
 ### Authenticate Docker to ECR
 
 ```bash
@@ -936,28 +938,6 @@ All of these drop in cleanly as additional CodePipeline stages if you need them 
 When you're done experimenting:
 
 ```bash
-# CodePipeline stack (section 7) — delete before the Lambda/ECR resources it depends on
-aws cloudformation delete-stack \
-  --stack-name hello-lambda-codepipeline \
-  --region ${AWS_REGION}
-aws cloudformation wait stack-delete-complete \
-  --stack-name hello-lambda-codepipeline \
-  --region ${AWS_REGION}
-
-# CodeStar Connection (section 7)
-CONNECTION_ARN=$(aws codestar-connections list-connections \
-  --region ${AWS_REGION} \
-  --query "Connections[?ConnectionName=='hello-lambda-github'].ConnectionArn" \
-  --output text)
-[ -n "${CONNECTION_ARN}" ] && aws codestar-connections delete-connection \
-  --connection-arn ${CONNECTION_ARN} \
-  --region ${AWS_REGION}
-
-# GitHub OIDC + IAM stack (section 6)
-aws cloudformation delete-stack \
-  --stack-name hello-lambda-github-oidc \
-  --region ${AWS_REGION}
-
 # Delete the Lambda function
 aws lambda delete-function --function-name ${FUNCTION_NAME}
 
@@ -981,7 +961,4 @@ aws ecr delete-repository \
 - [Docker Scout](https://docs.docker.com/scout/)
 - [AWS Lambda Runtime Interface Emulator](https://github.com/aws/aws-lambda-runtime-interface-emulator)
 - [GitHub Actions — OIDC with AWS](https://docs.github.com/en/actions/deployment/security-hardening-your-deployments/configuring-openid-connect-in-amazon-web-services)
-- [AWS CodeStar Connections](https://docs.aws.amazon.com/dtconsole/latest/userguide/welcome-connections.html)
-- [AWS CodePipeline — CodeStar source action](https://docs.aws.amazon.com/codepipeline/latest/userguide/action-reference-CodestarConnectionSource.html)
-- [AWS CodeBuild — build images for ARM](https://docs.aws.amazon.com/codebuild/latest/userguide/build-env-ref-available.html)
 - [Workshop: AWS Modernization with Docker](https://docker.awsworkshop.io)
