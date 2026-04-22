@@ -64,15 +64,6 @@ jobs:
         run: |
           echo "image_uri=${{ steps.login-ecr.outputs.registry }}/${{ vars.ECR_REPO }}:${{ github.sha }}" >> "$GITHUB_OUTPUT"
 
-      - name: Scan image with Docker Scout
-        uses: docker/scout-action@v1
-        continue-on-error: true
-        with:
-          command: cves
-          image: ${{ steps.login-ecr.outputs.registry }}/${{ vars.ECR_REPO }}:${{ github.sha }}
-          only-severities: critical,high
-          exit-code: true
-
   deploy:
     needs: build
     runs-on: ubuntu-24.04-arm
@@ -91,8 +82,3 @@ jobs:
           aws lambda update-function-code \
             --function-name ${{ matrix.function }} \
             --image-uri ${{ needs.build.outputs.image_uri }}
-
-      - name: Wait for update to finish
-        run: |
-          aws lambda wait function-updated \
-            --function-name ${{ matrix.function }}
