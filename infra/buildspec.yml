@@ -23,13 +23,11 @@ phases:
     commands:
       - 'echo "Building image for linux/arm64..."'
       - 'docker build --platform linux/arm64 -t ${IMAGE_URI} .'
-      - 'docker tag ${IMAGE_URI} ${REGISTRY}/${ECR_REPO}:latest'
 
   post_build:
     commands:
       - 'echo "Pushing image to ECR..."'
       - 'docker push ${IMAGE_URI}'
-      - 'docker push ${REGISTRY}/${ECR_REPO}:latest'
       - 'echo "Updating Lambda function code..."'
       - 'aws lambda update-function-code --function-name ${LAMBDA_FUNCTION_NAME} --image-uri ${IMAGE_URI} --region ${AWS_REGION}'
       - 'aws lambda wait function-updated --function-name ${LAMBDA_FUNCTION_NAME} --region ${AWS_REGION}'
