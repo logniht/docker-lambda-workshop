@@ -11,21 +11,25 @@ This directory pairs with the [Docker & ECR for Lambda](../docker-ecr-lambda-dec
 | `Dockerfile` | Minimal Lambda container image built on `public.ecr.aws/lambda/python:3.12` |
 | `requirements.txt` | Single third-party dependency (`requests`) so `pip install` does real work |
 | `app.py` | Handler that fetches the public IP of the execution environment |
-| `deploy.yml` | GitHub Actions workflow — build, scan, push to ECR, deploy to Lambda |
+| `trust-policy.json` | Lambda execution role trust policy (used in section 4) |
+| `lifecycle.json` | ECR lifecycle policy that expires untagged images after 7 days (used in section 3) |
+| `infra/github-oidc-roles.yaml` | CloudFormation template for the GitHub OIDC provider and IAM deploy roles |
 | `README.md` | This file |
+
+The GitHub Actions workflow lives at [`.github/workflows/deploy.yml`](./.github/workflows/deploy.yml) at the root of this repository — GitHub only discovers workflows at that path.
 
 ## Prerequisites
 
 - Docker (or Docker Desktop) running locally
 - AWS CLI v2 configured with credentials that can push to ECR and update Lambda
 - `jq` for pretty-printing responses (optional)
-- An AWS account and a region to work in (examples use `eu-west-1`)
+- An AWS account and a region to work in (examples use `us-west-2`)
 
 Set these environment variables once to avoid repeating them:
 
 ```bash
 export AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-export AWS_REGION=eu-west-1
+export AWS_REGION=us-west-2
 export ECR_REPO=hello-lambda
 export IMAGE_TAG=v1.0.0
 export FUNCTION_NAME=hello-lambda
@@ -45,6 +49,20 @@ Verify:
 ```bash
 docker images ${ECR_REPO}
 ```
+
+Check which CPU architecture the image was built for — it should match the Lambda function's `--architectures` setting:
+
+```bash
+docker image inspect ${ECR_REPO}:${IMAGE_TAG} --format '{{.Architecture}}'
+```
+
+On Apple Silicon Macs this prints `arm64`. On Intel/AMD machines it prints `amd64`. The Lambda function created in section 4 is configured for `arm64`, so Apple Silicon users can build native without any `--platform` flag. Intel/AMD users should either build with `--platform linux/arm64` (requires emulation via Docker Desktop Rosetta or QEMU) or switch the Lambda to `--architectures x86_64` in section 4.
+
+### Why arm64?
+
+- **Native on Apple Silicon.** No QEMU/Rosetta emulation during build.
+- **~20% cheaper on Lambda** — Graviton pricing.
+- **AWS's default going forward.** New AWS services and base images target arm64 first.
 
 ### Why the Dockerfile looks the way it does
 
@@ -72,6 +90,34 @@ CMD ["app.handler"]
 
 Scanning early is cheaper than scanning late. Run Scout before pushing.
 
+### Install the Scout CLI plugin (one-time)
+
+Scout ships bundled with recent Docker Desktop, but on Linux or older Docker installations you may see:
+
+```
+docker: 'scout' is not a docker command
+```
+
+Install it with the official one-liner (macOS and Linux):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/docker/scout-cli/main/install.sh | sh -s --
+```
+
+Verify:
+
+```bash
+docker scout version
+```
+
+Scout needs a free Docker Hub account to pull CVE data. Log in once:
+
+```bash
+docker login
+```
+
+### Run the scan
+
 ```bash
 # Quick overview
 docker scout quickview ${ECR_REPO}:${IMAGE_TAG}
@@ -96,8 +142,6 @@ docker scout cves ${ECR_REPO}:${IMAGE_TAG} \
   --only-severity critical,high \
   --exit-code
 ```
-
-Requires a free Docker Hub account and `docker login`.
 
 ## 3. Push to Amazon ECR
 
@@ -132,29 +176,159 @@ docker tag ${ECR_REPO}:${IMAGE_TAG} ${REGISTRY}/${ECR_REPO}:${IMAGE_TAG}
 docker push ${REGISTRY}/${ECR_REPO}:${IMAGE_TAG}
 ```
 
-### Set a lifecycle policy (recommended)
+### Scan in ECR (post-push)
 
-Auto-delete untagged images after seven days so ECR doesn't fill up with orphan layers:
+Because the repository was created with `scanOnPush=true`, ECR automatically starts a vulnerability scan as soon as the image lands. ECR offers two scan types with very different coverage — it's worth understanding which you're using.
+
+#### Basic vs. enhanced scanning
+
+| Feature | Basic scanning (default) | Enhanced scanning |
+|---|---|---|
+| Scanner | ECR-native (Clair-based) | Amazon Inspector |
+| OS packages | ✅ | ✅ |
+| Language libraries (pip, npm, Maven, Go, Rust…) | ❌ | ✅ |
+| Continuous re-scan as new CVEs appear | ❌ | ✅ |
+| Findings API | `ecr describe-image-scan-findings` | `inspector2 list-findings` |
+| Console | ECR → image → Scan findings tab | Amazon Inspector → Findings |
+| Cost | Free | Per-image + per-monitoring-day |
+
+Basic scanning is what `scanOnPush=true` gives you by default. Enhanced scanning is opt-in at the registry level.
+
+#### Retrieve basic-scan findings
 
 ```bash
-cat > lifecycle.json <<'EOF'
-{
-  "rules": [
-    {
-      "rulePriority": 1,
-      "description": "Expire untagged images after 7 days",
-      "selection": {
-        "tagStatus": "untagged",
-        "countType": "sinceImagePushed",
-        "countUnit": "days",
-        "countNumber": 7
-      },
-      "action": { "type": "expire" }
-    }
-  ]
-}
-EOF
+# Start a scan manually (optional — scanOnPush already triggers one)
+aws ecr start-image-scan \
+  --repository-name ${ECR_REPO} \
+  --image-id imageTag=${IMAGE_TAG} \
+  --region ${AWS_REGION}
 
+# Check scan status — returns IN_PROGRESS, COMPLETE, or FAILED
+aws ecr describe-image-scan-findings \
+  --repository-name ${ECR_REPO} \
+  --image-id imageTag=${IMAGE_TAG} \
+  --region ${AWS_REGION} \
+  --query 'imageScanStatus'
+
+# Summary of findings by severity
+aws ecr describe-image-scan-findings \
+  --repository-name ${ECR_REPO} \
+  --image-id imageTag=${IMAGE_TAG} \
+  --region ${AWS_REGION} \
+  --query 'imageScanFindings.findingSeverityCounts'
+
+# Full findings as a table (severity, CVE ID, NVD link)
+aws ecr describe-image-scan-findings \
+  --repository-name ${ECR_REPO} \
+  --image-id imageTag=${IMAGE_TAG} \
+  --region ${AWS_REGION} \
+  --query 'imageScanFindings.findings[*].[severity, name, uri]' \
+  --output table
+```
+
+The initial scan takes 30–60 seconds. If the status is `IN_PROGRESS`, wait and retry.
+
+#### Enable enhanced scanning
+
+If basic scanning reports no findings on an image you suspect is vulnerable (especially one with Python/Node/Go dependencies), it's because basic scanning doesn't look inside language ecosystems. Turn on enhanced scanning:
+
+```bash
+# Enable Amazon Inspector for ECR in this region (one-time)
+aws inspector2 enable \
+  --resource-types ECR \
+  --region ${AWS_REGION}
+
+# Tell ECR to use enhanced scanning on push for all repositories
+aws ecr put-registry-scanning-configuration \
+  --scan-type ENHANCED \
+  --rules '[{"scanFrequency":"SCAN_ON_PUSH","repositoryFilters":[{"filter":"*","filterType":"WILDCARD"}]}]' \
+  --region ${AWS_REGION}
+```
+
+Push the image again so Inspector scans it:
+
+```bash
+docker push ${REGISTRY}/${ECR_REPO}:${IMAGE_TAG}
+```
+
+#### Retrieve enhanced-scan findings (Amazon Inspector)
+
+Enhanced findings do **not** appear in `describe-image-scan-findings`. They live in Inspector:
+
+```bash
+aws inspector2 list-findings \
+  --filter-criteria '{"ecrImageTags":[{"comparison":"EQUALS","value":"'"${IMAGE_TAG}"'"}],"ecrImageRepositoryName":[{"comparison":"EQUALS","value":"'"${ECR_REPO}"'"}]}' \
+  --region ${AWS_REGION} \
+  --query 'findings[*].[severity, title, packageVulnerabilityDetails.vulnerablePackages[0].name, packageVulnerabilityDetails.vulnerablePackages[0].version]' \
+  --output table
+```
+
+Filter to critical and high only:
+
+```bash
+aws inspector2 list-findings \
+  --filter-criteria '{"ecrImageTags":[{"comparison":"EQUALS","value":"'"${IMAGE_TAG}"'"}],"ecrImageRepositoryName":[{"comparison":"EQUALS","value":"'"${ECR_REPO}"'"}],"severity":[{"comparison":"EQUALS","value":"CRITICAL"},{"comparison":"EQUALS","value":"HIGH"}]}' \
+  --region ${AWS_REGION} \
+  --output table
+```
+
+Or view findings in the console: **Amazon Inspector → Findings → filter by ECR repository**.
+
+### Scout vs. Inspector — interpreting the differences
+
+Running Scout and Inspector on the same image often produces different findings. That's expected, and understanding why is one of the most important lessons of this workshop.
+
+| | Docker Scout | Amazon Inspector (enhanced ECR scan) |
+|---|---|---|
+| **When** | Locally, pre-push, or in CI | In ECR, post-push + continuous |
+| **Coverage** | OS packages + language libraries + indirect deps | OS packages + language libraries |
+| **Data sources** | GitHub Advisory DB, NVD, OSV, vendor feeds | AWS-curated feeds backed by Inspector |
+| **Philosophy** | Full CVE inventory — reports everything found | Actionable findings — reports what you can fix |
+| **CI integration** | `docker scout cves --exit-code` fails the build | EventBridge events → SNS, Slack, ticketing |
+
+#### Why Inspector may report fewer CVEs than Scout
+
+Inspector deliberately suppresses individual CVEs when there's no fix available and instead emits a higher-level finding. The most common example:
+
+> **Platform End Of Life** (severity: CRITICAL)
+
+This appears when the base image's OS is no longer receiving security updates from its distribution (for example, `node:12` on Debian Stretch, EOL June 2022). Inspector's reasoning: listing individual libxslt/libcurl/openssl CVEs isn't useful if the fix is *"replace the whole base image"*. One clear finding is louder than 40 individual ones.
+
+Scout takes the opposite approach — it lists every CVE from public feeds regardless of whether a distro-supplied fix exists. So you'll often see Scout report 4–40 CVEs while Inspector reports 1 "Platform EOL" finding that covers all of them.
+
+#### Which is "right"?
+
+Both. They answer different questions:
+
+- **Scout** — *"What CVEs are present in this image?"* (full inventory)
+- **Inspector** — *"What should I do about them?"* (prioritised, actionable)
+
+In practice:
+- Use **Scout as a pre-push gate** to fail builds on known-fixable critical/high CVEs.
+- Use **Inspector for continuous monitoring** so you hear about CVEs disclosed after push and get a clean list of what's actually fixable.
+- Treat **Platform EOL findings as the top priority** — they usually subsume dozens of individual CVEs, and the fix (upgrade the base image) clears the lot.
+
+#### Teaching demo: vulnerable vs. clean base
+
+The quickest way to show this trade-off is to scan an image with an old base, then one with a current base:
+
+```bash
+# Vulnerable: old base image on an EOL distro
+# FROM node:12           → Debian Stretch (EOL)
+# FROM python:3.8-slim   → Debian Buster (EOL)
+
+# Clean: current base
+# FROM node:20           → Debian Bookworm
+# FROM public.ecr.aws/lambda/python:3.12  → Amazon Linux 2023
+```
+
+Rebuild, push, re-scan with both tools. Scout's CVE count drops drastically. Inspector's "Platform EOL" finding disappears entirely. Both scanners agree the image is in much better shape.
+
+### Set a lifecycle policy (recommended)
+
+Auto-delete untagged images after seven days so ECR doesn't fill up with orphan layers. The policy document is already in [`lifecycle.json`](./lifecycle.json):
+
+```bash
 aws ecr put-lifecycle-policy \
   --repository-name ${ECR_REPO} \
   --lifecycle-policy-text file://lifecycle.json
@@ -164,18 +338,9 @@ aws ecr put-lifecycle-policy \
 
 ### IAM role (one-time)
 
-```bash
-cat > trust-policy.json <<'EOF'
-{
-  "Version": "2012-10-17",
-  "Statement": [{
-    "Effect": "Allow",
-    "Principal": { "Service": "lambda.amazonaws.com" },
-    "Action": "sts:AssumeRole"
-  }]
-}
-EOF
+The Lambda execution role's trust policy is already in [`trust-policy.json`](./trust-policy.json):
 
+```bash
 aws iam create-role \
   --role-name ${FUNCTION_NAME}-role \
   --assume-role-policy-document file://trust-policy.json
@@ -195,10 +360,11 @@ aws lambda create-function \
   --role arn:aws:iam::${AWS_ACCOUNT_ID}:role/${FUNCTION_NAME}-role \
   --timeout 30 \
   --memory-size 512 \
+  --architectures arm64 \
   --region ${AWS_REGION}
 ```
 
-`--package-type Image` tells Lambda to pull from ECR. The image URI must be in the same region as the function.
+`--package-type Image` tells Lambda to pull from ECR. The image URI must be in the same region as the function. `--architectures arm64` must match the architecture of the image you pushed (see section 1). Architecture cannot be changed after the function is created — you'd need to delete and recreate.
 
 ### Invoke it
 
@@ -272,7 +438,7 @@ curl -XPOST "http://localhost:9000/2015-03-31/functions/function/invocations" \
 
 ## 6. CI/CD with GitHub Actions
 
-The workflow in [`deploy.yml`](./deploy.yml) automates everything above. It triggers on a published GitHub Release (or manual dispatch) and does:
+The workflow in [`.github/workflows/deploy.yml`](./.github/workflows/deploy.yml) automates everything above. It triggers on a published GitHub Release (or manual dispatch) and does:
 
 1. Build the image with Docker Buildx, with GHA-backed cache
 2. Tag it with the commit SHA (immutable, traceable)
@@ -300,22 +466,169 @@ Every one of these maps to a recommendation from the review of the customer's or
 | **Current action major versions** | `docker/metadata-action@v5`, `docker/build-push-action@v6` |
 | **`mask-aws-account-id` default** | Keeps the account ID out of workflow logs |
 
-### Required GitHub configuration
+### One-time setup — AWS OIDC provider and IAM roles
 
-Under repository **Settings → Secrets and variables → Actions → Variables**:
+Before the workflow can assume an AWS role from GitHub, the account needs:
 
-| Variable | Example |
+1. A GitHub Actions OIDC provider (`token.actions.githubusercontent.com`).
+2. An IAM role for ECR push (scoped to your repo).
+3. An IAM role for Lambda deploy (scoped to your repo and function).
+
+Both roles trust only the specific GitHub repository via the `sub` claim, so they can't be assumed from any other repo.
+
+#### Deploy with CloudFormation (recommended)
+
+A ready-made template lives at [`infra/github-oidc-roles.yaml`](./infra/github-oidc-roles.yaml). Deploy it:
+
+```bash
+export GITHUB_ORG=<your-github-org-or-user>
+export GITHUB_REPO=<your-repo-name>
+
+aws cloudformation deploy \
+  --stack-name hello-lambda-github-oidc \
+  --template-file infra/github-oidc-roles.yaml \
+  --region ${AWS_REGION} \
+  --capabilities CAPABILITY_NAMED_IAM \
+  --parameter-overrides \
+    GitHubOrg=${GITHUB_ORG} \
+    GitHubRepo=${GITHUB_REPO} \
+    EcrRepositoryName=${ECR_REPO} \
+    LambdaFunctionName=${FUNCTION_NAME}
+```
+
+If the GitHub OIDC provider already exists in the account (only one can exist per account), add `CreateOidcProvider=false` to the `--parameter-overrides`.
+
+Get the role ARNs:
+
+```bash
+aws cloudformation describe-stacks \
+  --stack-name hello-lambda-github-oidc \
+  --region ${AWS_REGION} \
+  --query 'Stacks[0].Outputs' \
+  --output table
+```
+
+#### Or: pure CLI alternative
+
+If you'd rather not use CloudFormation:
+
+```bash
+# 1. Create the OIDC provider (skip if it already exists in the account)
+aws iam create-open-id-connect-provider \
+  --url https://token.actions.githubusercontent.com \
+  --client-id-list sts.amazonaws.com \
+  --thumbprint-list 6938fd4d98bab03faadb97b34396831e3780aea1
+
+# 2. Trust policy template (save as trust-policy.json and edit ORG/REPO)
+cat > trust-policy.json <<EOF
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Principal": {
+      "Federated": "arn:aws:iam::${AWS_ACCOUNT_ID}:oidc-provider/token.actions.githubusercontent.com"
+    },
+    "Action": "sts:AssumeRoleWithWebIdentity",
+    "Condition": {
+      "StringEquals": {
+        "token.actions.githubusercontent.com:aud": "sts.amazonaws.com"
+      },
+      "StringLike": {
+        "token.actions.githubusercontent.com:sub": "repo:${GITHUB_ORG}/${GITHUB_REPO}:*"
+      }
+    }
+  }]
+}
+EOF
+
+# 3. ECR push role
+aws iam create-role \
+  --role-name github-ecr-push \
+  --assume-role-policy-document file://trust-policy.json
+
+aws iam put-role-policy \
+  --role-name github-ecr-push \
+  --policy-name EcrPush \
+  --policy-document "{
+    \"Version\": \"2012-10-17\",
+    \"Statement\": [
+      {\"Effect\": \"Allow\", \"Action\": \"ecr:GetAuthorizationToken\", \"Resource\": \"*\"},
+      {\"Effect\": \"Allow\", \"Action\": [
+        \"ecr:BatchCheckLayerAvailability\",\"ecr:BatchGetImage\",\"ecr:CompleteLayerUpload\",
+        \"ecr:GetDownloadUrlForLayer\",\"ecr:InitiateLayerUpload\",\"ecr:PutImage\",\"ecr:UploadLayerPart\"
+      ], \"Resource\": \"arn:aws:ecr:${AWS_REGION}:${AWS_ACCOUNT_ID}:repository/${ECR_REPO}\"}
+    ]
+  }"
+
+# 4. Lambda deploy role
+aws iam create-role \
+  --role-name github-lambda-deploy \
+  --assume-role-policy-document file://trust-policy.json
+
+aws iam put-role-policy \
+  --role-name github-lambda-deploy \
+  --policy-name LambdaDeploy \
+  --policy-document "{
+    \"Version\": \"2012-10-17\",
+    \"Statement\": [{
+      \"Effect\": \"Allow\",
+      \"Action\": [\"lambda:UpdateFunctionCode\",\"lambda:GetFunction\"],
+      \"Resource\": \"arn:aws:lambda:${AWS_REGION}:${AWS_ACCOUNT_ID}:function:${FUNCTION_NAME}\"
+    }]
+  }"
+```
+
+### GitHub repository variables
+
+Under the repo's **Settings → Secrets and variables → Actions → Variables** tab, add three repository variables (not secrets — these are ARNs, not credentials):
+
+| Variable | Value |
 |---|---|
-| `AWS_ROLE_TO_ASSUME_ECR` | `arn:aws:iam::<account>:role/github-ecr-push` |
-| `AWS_ROLE_TO_ASSUME_LAMBDAS` | `arn:aws:iam::<account>:role/github-lambda-deploy` |
+| `AWS_ROLE_TO_ASSUME_ECR` | ARN of `github-ecr-push` (from stack output) |
+| `AWS_ROLE_TO_ASSUME_LAMBDAS` | ARN of `github-lambda-deploy` (from stack output) |
 | `ECR_REPO` | `hello-lambda` |
 
-Both IAM roles need a trust policy that trusts GitHub's OIDC provider, scoped to your specific repository and branch. See the [GitHub + AWS OIDC guide](https://docs.github.com/en/actions/deployment/security-hardening-your-deployments/configuring-openid-connect-in-amazon-web-services) for the trust policy template.
+### Workflow location
+
+The workflow lives at `.github/workflows/deploy.yml` at the root of this repository — GitHub only discovers workflows under that path. The `context: .` in the build step points Docker at the repo root where the `Dockerfile` lives.
 
 ### Triggering a deploy
 
-- **On release:** create a GitHub Release. The workflow runs automatically and deploys the tagged commit.
-- **Manual:** use the **Run workflow** button on the Actions tab. Leave `image_tag` empty to deploy the current SHA, or supply a prior SHA to roll back.
+- **On release:** create a GitHub Release (Releases → Draft a new release → Publish). The workflow runs automatically and deploys the tagged commit.
+- **Manual:** Actions tab → **Deploy hello-lambda** → **Run workflow**. Leave `image_tag` empty to deploy the current SHA, or supply a prior SHA to roll back.
+
+### arm64 runners
+
+Both jobs run on `ubuntu-24.04-arm` (public preview, free for public repos). Native arm64 runners avoid QEMU emulation and keep the workflow consistent with the arm64 Lambda. If you switch to a private repo, check GitHub's pricing for arm64 runners — they may incur extra billing.
+
+### Scout is advisory for now
+
+The Docker Scout step has `continue-on-error: true` set. If Scout finds critical or high CVEs, the workflow prints the findings but **doesn't fail the build** — the image still gets pushed and deployed.
+
+This is deliberate for first-run stability. Once the pipeline works end-to-end and you're confident in the base image baseline, remove `continue-on-error: true` from the workflow:
+
+```yaml
+- name: Scan image with Docker Scout
+  uses: docker/scout-action@v1
+  # continue-on-error: true    ← delete this line
+  with:
+    command: cves
+    ...
+    exit-code: true
+```
+
+With the flag gone, `exit-code: true` makes Scout fail the workflow when critical or high CVEs are found, which is the real security gate. Treat the advisory period as a migration ramp, not a permanent state.
+
+### Why post-push ECR scanning isn't in the workflow
+
+The repository is created with `scanOnPush=true`, so ECR starts a vulnerability scan automatically every time an image lands. The workflow deliberately doesn't add an `aws ecr start-image-scan` step because:
+
+- **It would duplicate `scanOnPush`.** Scan-on-push already handles every deploy.
+- **Scout has already gated the build.** Critical and high CVEs fail the pipeline before the image reaches ECR.
+- **Polling ECR for results in CI is fragile.** Scans take 30–60 seconds; wait loops and timeouts add complexity for a check Scout already performed.
+- **Post-push scanning is a monitoring concern, not a deploy concern.** Its value is catching CVEs disclosed *after* the image has been sitting in ECR — something a deploy pipeline can't observe.
+
+For continuous post-push monitoring, wire ECR scan findings to EventBridge and route critical/high severities to SNS, Slack, or a ticketing system. That pattern fits the session 4 observability conversation, not the deploy workflow.
 
 ### What this workflow intentionally skips
 
