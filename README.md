@@ -43,6 +43,9 @@ All hands-on commands run from inside your fork of the workshop repo.
 **With the GitHub CLI (fastest — fork and clone in one step):**
 
 ```bash
+# Check if already authenticated
+gh auth status || gh auth login
+
 gh repo fork logniht/docker-lambda-workshop --clone=true
 cd docker-lambda-workshop
 ```
