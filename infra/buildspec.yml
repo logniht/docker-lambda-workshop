@@ -33,6 +33,7 @@ phases:
       - 'echo "Updating Lambda function code..."'
       - 'aws lambda update-function-code --function-name ${LAMBDA_FUNCTION_NAME} --image-uri ${IMAGE_URI} --region ${AWS_REGION}'
       - 'aws lambda wait function-updated --function-name ${LAMBDA_FUNCTION_NAME} --region ${AWS_REGION}'
+      - 'aws lambda get-function-configuration --function-name ${LAMBDA_FUNCTION_NAME} --region ${AWS_REGION} --query "{State:State,LastUpdateStatus:LastUpdateStatus,LastUpdateStatusReason:LastUpdateStatusReason,ImageUri:Code.ImageUri}"'
       - 'echo "Writing build artefact..."'
       - 'printf ''{"imageUri":"%s","imageTag":"%s"}'' "${IMAGE_URI}" "${IMAGE_TAG}" > imageDetail.json'
 

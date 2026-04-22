@@ -92,6 +92,7 @@ Resources:
                 Action:
                   - lambda:UpdateFunctionCode
                   - lambda:GetFunction
+                  - lambda:GetFunctionConfiguration
                 Resource: !Sub arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${LambdaFunctionName}
               - Sid: ArtefactBucket
                 Effect: Allow
