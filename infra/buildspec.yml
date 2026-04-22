@@ -1,0 +1,44 @@
+version: 0.2
+
+# CodeBuild buildspec for the Lambda container image.
+# Called by the Build stage of the CodePipeline defined in lambda-codepipeline.yaml.
+#
+# Environment variables expected (set by CodeBuild):
+#   AWS_ACCOUNT_ID        — account where ECR and Lambda live
+#   AWS_REGION            — deploy region
+#   ECR_REPO              — ECR repository name (e.g. hello-lambda)
+#   LAMBDA_FUNCTION_NAME  — target Lambda function (e.g. hello-lambda)
+
+phases:
+  pre_build:
+    commands:
+      - echo "Logging in to Amazon ECR..."
+      - REGISTRY=${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com
+      - aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin ${REGISTRY}
+      - IMAGE_TAG=${CODEBUILD_RESOLVED_SOURCE_VERSION:0:7}
+      - IMAGE_URI=${REGISTRY}/${ECR_REPO}:${IMAGE_TAG}
+      - echo "Image URI: ${IMAGE_URI}"
+
+  build:
+    commands:
+      - echo "Building image for linux/arm64..."
+      - docker build --platform linux/arm64 -t ${IMAGE_URI} .
+      - docker tag ${IMAGE_URI} ${REGISTRY}/${ECR_REPO}:latest
+
+  post_build:
+    commands:
+      - echo "Pushing image to ECR..."
+      - docker push ${IMAGE_URI}
+      - docker push ${REGISTRY}/${ECR_REPO}:latest
+      - echo "Updating Lambda function code..."
+      - aws lambda update-function-code
+          --function-name ${LAMBDA_FUNCTION_NAME}
+          --image-uri ${IMAGE_URI}
+          --region ${AWS_REGION}
+      - aws lambda wait function-updated --function-name ${LAMBDA_FUNCTION_NAME} --region ${AWS_REGION}
+      - echo "Writing build artefact..."
+      - printf '{"imageUri":"%s","imageTag":"%s"}' "${IMAGE_URI}" "${IMAGE_TAG}" > imageDetail.json
+
+artifacts:
+  files:
+    - imageDetail.json
