@@ -1,0 +1,119 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  GitHub Actions OIDC provider plus two least-privilege roles for the
+  hello-lambda workshop: one to push images to ECR, one to update Lambda.
+
+Parameters:
+  GitHubOrg:
+    Type: String
+    Description: GitHub organisation or user that owns the repo (e.g. my-org).
+  GitHubRepo:
+    Type: String
+    Description: GitHub repository name (e.g. hotusa-workshop).
+  EcrRepositoryName:
+    Type: String
+    Default: hello-lambda
+    Description: ECR repository that the workflow will push images to.
+  LambdaFunctionName:
+    Type: String
+    Default: hello-lambda
+    Description: Lambda function that the workflow will update.
+  CreateOidcProvider:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: >
+      Create the GitHub OIDC provider. Set to 'false' if the provider already
+      exists in this account (only one can exist per account).
+
+Conditions:
+  ShouldCreateOidcProvider: !Equals [!Ref CreateOidcProvider, 'true']
+
+Resources:
+  GitHubOidcProvider:
+    Type: AWS::IAM::OIDCProvider
+    Condition: ShouldCreateOidcProvider
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList:
+        - sts.amazonaws.com
+      ThumbprintList:
+        # GitHub uses a library-managed cert since mid-2023; thumbprint is
+        # validated dynamically by AWS. Any valid thumbprint works as a placeholder.
+        - 6938fd4d98bab03faadb97b34396831e3780aea1
+
+  EcrPushRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: github-ecr-push
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+              StringLike:
+                token.actions.githubusercontent.com:sub: !Sub repo:${GitHubOrg}/${GitHubRepo}:*
+      Policies:
+        - PolicyName: EcrPush
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: EcrAuth
+                Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: '*'
+              - Sid: EcrPush
+                Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:BatchGetImage
+                  - ecr:CompleteLayerUpload
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:InitiateLayerUpload
+                  - ecr:PutImage
+                  - ecr:UploadLayerPart
+                Resource: !Sub arn:${AWS::Partition}:ecr:${AWS::Region}:${AWS::AccountId}:repository/${EcrRepositoryName}
+
+  LambdaDeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: github-lambda-deploy
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+              StringLike:
+                token.actions.githubusercontent.com:sub: !Sub repo:${GitHubOrg}/${GitHubRepo}:*
+      Policies:
+        - PolicyName: LambdaDeploy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: UpdateFunctionCode
+                Effect: Allow
+                Action:
+                  - lambda:UpdateFunctionCode
+                  - lambda:GetFunction
+                Resource: !Sub arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${LambdaFunctionName}
+
+Outputs:
+  EcrPushRoleArn:
+    Description: ARN to set as the AWS_ROLE_TO_ASSUME_ECR GitHub variable.
+    Value: !GetAtt EcrPushRole.Arn
+  LambdaDeployRoleArn:
+    Description: ARN to set as the AWS_ROLE_TO_ASSUME_LAMBDAS GitHub variable.
+    Value: !GetAtt LambdaDeployRole.Arn
+  EcrRepoVariable:
+    Description: Value to set as the ECR_REPO GitHub variable.
+    Value: !Ref EcrRepositoryName
