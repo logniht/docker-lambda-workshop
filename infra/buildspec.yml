@@ -31,10 +31,7 @@ phases:
       - docker push ${IMAGE_URI}
       - docker push ${REGISTRY}/${ECR_REPO}:latest
       - echo "Updating Lambda function code..."
-      - aws lambda update-function-code
-          --function-name ${LAMBDA_FUNCTION_NAME}
-          --image-uri ${IMAGE_URI}
-          --region ${AWS_REGION}
+      - aws lambda update-function-code --function-name ${LAMBDA_FUNCTION_NAME} --image-uri ${IMAGE_URI} --region ${AWS_REGION}
       - aws lambda wait function-updated --function-name ${LAMBDA_FUNCTION_NAME} --region ${AWS_REGION}
       - echo "Writing build artefact..."
       - printf '{"imageUri":"%s","imageTag":"%s"}' "${IMAGE_URI}" "${IMAGE_TAG}" > imageDetail.json
