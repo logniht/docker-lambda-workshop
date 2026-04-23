@@ -78,7 +78,7 @@ export REGISTRY=${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com
 
 ## 1. Build the image
 
-From inside `lambda-hands-on/`:
+From inside `docker-lambda-workshop/`:
 
 ```bash
 docker build -t ${ECR_REPO}:${IMAGE_TAG} .
@@ -141,7 +141,8 @@ docker: 'scout' is not a docker command
 Install it with the official one-liner (macOS and Linux):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/docker/scout-cli/main/install.sh | sh -s --
+curl -fsSL https://raw.githubusercontent.com/docker/scout-cli/main/install.sh -o install-scout.sh
+sh install-scout.sh
 ```
 
 Verify:
@@ -432,6 +433,7 @@ Expected output:
 # Build a new tag
 export IMAGE_TAG=v1.0.1
 docker build -t ${REGISTRY}/${ECR_REPO}:${IMAGE_TAG} .
+docker build -t ${ECR_REPO}:${IMAGE_TAG} .
 docker push ${REGISTRY}/${ECR_REPO}:${IMAGE_TAG}
 
 # Point Lambda at the new image
@@ -624,10 +626,21 @@ You already forked and cloned the workshop repo at the start. Two things still n
 
 **Deploy the CloudFormation stack (if you haven't already).** Follow the "One-time setup — AWS OIDC provider and IAM roles" steps above. The IAM role's trust policy is scoped to exactly your fork's `owner/repo`, so the stack must be deployed with your values.
 
-**Enable Actions on the fork.** Forked repos have GitHub Actions disabled by default, and there's no `gh` command to enable them — this must be done through the UI. On your fork's page:
+**Enable Actions on the fork.** Forked repos have GitHub Actions disabled by default. Enable via the CLI:
 
-1. Go to the **Actions** tab
-2. Click **I understand my workflows, go ahead and enable them**
+```bash
+gh api -X PUT repos/${FORK_REPO}/actions/permissions \
+  --field enabled=true \
+  --field allowed_actions=all
+```
+
+Or in the browser: go to your fork's **Actions** tab and click **I understand my workflows, go ahead and enable them**.
+
+Verify the workflow is visible:
+
+```bash
+gh workflow list --repo ${FORK_REPO}
+```
 
 Without this step, the workflow won't run when triggered.
 
@@ -645,12 +658,27 @@ A manual run is the fastest way to iterate before cutting a release.
 Or trigger from the CLI with [`gh`](https://cli.github.com/):
 
 ```bash
-gh workflow run "Deploy hello-lambda" --repo ${GITHUB_ORG}/${GITHUB_REPO}
+gh workflow run "Deploy hello-lambda" --repo ${FORK_REPO}
 ```
 
 #### 3. Watch the run
 
-In the Actions tab, click the running workflow to see both jobs stream their logs. What to check at each step:
+From the CLI:
+
+```bash
+# List recent runs
+gh run list --workflow="deploy.yml" --repo ${FORK_REPO} --limit 3
+
+# Watch the latest run in real time
+gh run watch --repo ${FORK_REPO}
+
+# Or view a specific run by ID
+gh run view <run-id> --repo ${FORK_REPO}
+```
+
+Always use `--repo ${FORK_REPO}` — without it, `gh` defaults to the upstream repo (the one you forked from), not your fork.
+
+Or in the browser: open the **Actions** tab on your fork, click the running workflow to see both jobs stream their logs. What to check at each step:
 
 | Step | What to look for |
 |---|---|
