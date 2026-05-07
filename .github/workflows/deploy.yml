@@ -64,6 +64,16 @@ jobs:
         run: |
           echo "image_uri=${{ steps.login-ecr.outputs.registry }}/${{ vars.ECR_REPO }}:${{ github.sha }}" >> "$GITHUB_OUTPUT"
 
+      # - name: Scan image with Docker Scout
+      #   uses: docker/scout-action@v1
+      #   continue-on-error: true
+      #   with:
+      #     command: cves
+      #     image: ${{ steps.login-ecr.outputs.registry }}/${{ vars.ECR_REPO }}:${{ github.sha }}
+      #     only-severities: critical,high
+      #     exit-code: true
+      #     scout-token: ${{ secrets.DOCKER_SCOUT_TOKEN }}
+
   deploy:
     needs: build
     runs-on: ubuntu-24.04-arm
